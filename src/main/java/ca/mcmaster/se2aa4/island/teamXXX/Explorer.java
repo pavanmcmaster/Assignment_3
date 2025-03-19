@@ -7,292 +7,230 @@ import org.json.JSONObject;
 import org.json.JSONTokener;
 
 import java.io.StringReader;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
- * Example Explorer that:
- *  - Starts at (1,1), facing East.
- *  - Moves in a small bounding box [x from 1..5, y from 1..5],
- *    so we never go out of radio range.
- *  - Uses a naive row-by-row "zig-zag" pattern, scanning every
- *    3 steps.
- *  - Immediately stops if battery < 15, or if we found a creek & the site,
- *    or if we risk going out of range.
+ * A "large bounding box" Explorer that:
+ *  - Forbids position from going beyond [1..20,000, 1..20,000].
+ *  - Moves row-by-row, scanning every 3 steps.
+ *  - Stops on low battery or after finding a creek + site.
+ *  - No "radar" action => avoids "Invalid JSON input : radar" error.
  */
 public class Explorer implements IExplorerRaid {
 
     private static final Logger logger = LogManager.getLogger(Explorer.class);
 
+    // --------------------------------------------------
+    // Configuration: Large bounding box
+    // --------------------------------------------------
+    private static final int MIN_X = 1;
+    private static final int MAX_X = 20000;  // increased dramatically
+    private static final int MIN_Y = 1;
+    private static final int MAX_Y = 20000;  // likewise
+
+    // Stop if battery < this
+    private static final int BATTERY_THRESHOLD = 15;
+
+    // --------------------------------------------------
     // Drone state
-    private int batteryLevel;
-    private Heading heading; 
-    private int posX, posY;      
+    // --------------------------------------------------
+    private int battery;
     private boolean missionOver;
+    private boolean foundSite;
+    private boolean foundCreek;
 
-    // Found POIs
-    private boolean foundEmergencySite;
-    private String foundCreekId;
+    // We'll track position and heading
+    private int posX;
+    private int posY;
+    private Heading heading;
 
-    // Keep track of visited cells (optional)
-    private final List<Coordinate> visitedTiles = new ArrayList<>();
-
-    // Basic config
-    private static final int SAFETY_THRESHOLD = 15; 
-    // We'll restrict ourselves to a small bounding box
-    private static final int MIN_X = 1, MAX_X = 5;
-    private static final int MIN_Y = 1, MAX_Y = 5;
-
+    // For row-by-row approach
     private boolean movingEast = true;
     private int stepCount = 0;
 
-    // Heading enum
     private enum Heading { NORTH, EAST, SOUTH, WEST }
 
-    private static class Coordinate {
-        final int x, y;
-        Coordinate(int x, int y) { this.x = x; this.y = y; }
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (!(o instanceof Coordinate)) return false;
-            Coordinate c = (Coordinate) o;
-            return x == c.x && y == c.y;
-        }
-        @Override
-        public int hashCode() { return 31*x + y; }
-        @Override
-        public String toString() { return "(" + x + "," + y + ")"; }
-    }
-
-    // ----------------------------------------------------------------
+    // --------------------------------------------------
     // 1) initialize
-    // ----------------------------------------------------------------
+    // --------------------------------------------------
     @Override
     public void initialize(String s) {
-        logger.info("** Initializing the Exploration Command Center");
-        JSONObject info = new JSONObject(new JSONTokener(new StringReader(s)));
-        logger.info("** Initialization info:\n {}", info.toString(2));
+        logger.info("** Initializing Explorer with bounding box [1..20000,1..20000]");
 
-        this.batteryLevel = info.getInt("budget"); // e.g. 7000
-        String dirStr = info.getString("heading"); // e.g. "E" or "EAST"
+        JSONObject initJson = new JSONObject(new JSONTokener(new StringReader(s)));
+        logger.info("Initialization data:\n{}", initJson.toString(2));
+
+        this.battery = initJson.getInt("budget");    // e.g. 7000
+        String dirStr = initJson.getString("heading"); // e.g. "EAST"
         this.heading = parseHeading(dirStr);
 
-        // We'll assume we start at (1,1)
+        // Start at (1,1) or wherever the environment says, but typically it's (1,1)
         this.posX = 1;
         this.posY = 1;
 
-        this.foundEmergencySite = false;
-        this.foundCreekId = null;
         this.missionOver = false;
+        this.foundSite = false;
+        this.foundCreek = false;
         this.stepCount = 0;
 
-        visitedTiles.clear();
-        visitedTiles.add(new Coordinate(posX, posY));
-
-        logger.info("** Start => pos=({},{}) heading={} budget={}", posX, posY, heading, batteryLevel);
+        logger.info("** Start => pos=({},{}), heading={}, battery={}",
+                    posX, posY, heading, battery);
     }
 
-    // ----------------------------------------------------------------
+    // --------------------------------------------------
     // 2) takeDecision
-    // ----------------------------------------------------------------
+    // --------------------------------------------------
     @Override
     public String takeDecision() {
         JSONObject decision = new JSONObject();
 
-        // If we must stop: 
+        // Stop conditions
         if (missionOver
-                || batteryLevel < SAFETY_THRESHOLD
-                || (foundEmergencySite && foundCreekId != null)) {
+                || battery < BATTERY_THRESHOLD
+                || (foundSite && foundCreek)) {
             decision.put("action", "stop");
-            logger.info("** Decision: STOP - missionOver or battery < {} or POIs found", SAFETY_THRESHOLD);
+            logger.info("** Decision: STOP (done or low battery).");
             return decision.toString();
         }
 
-        // Ensure we are not out of range already
+        // If we appear out of bounding box => stop
         if (!inBounds(posX, posY)) {
-            logger.warn("** We are out of safe range => stopping!");
+            logger.warn("** We're outside bounding box => STOP to avoid out_of_range!");
             decision.put("action", "stop");
+            missionOver = true;
             return decision.toString();
         }
 
-        // Implementation of naive pattern:
-        // - Every 3rd step => "scan"
-        // - Otherwise => "fly"
-        // - If we reached boundary on x => turn south & flip direction
-        // - If we reached boundary on y => turn north (some fallback), or stop
+        // We'll do a "scan" every 3rd step, otherwise "fly".
+        // Also do a row-by-row approach: if x=MAX_X (east), we turn south + flip direction,
+        // if x=MIN_X (west), same logic, etc.
         if (stepCount % 3 == 0) {
-            // We do a scan
             decision.put("action", "scan");
-            logger.info("** Decision: SCAN at stepCount={}", stepCount);
+            logger.info("** Decision: SCAN at step={}", stepCount);
         } else {
-            // Check boundary
+            // Check horizontal boundary
             if (movingEast && posX >= MAX_X) {
-                // Turn south if not at bottom boundary
+                // Turn south if possible
                 if (posY < MAX_Y) {
                     return headingCommand(decision, Heading.SOUTH);
                 } else {
-                    // If at the bottom, let's turn west
+                    // If y=MAX_Y too, let's flip west
                     movingEast = false;
                     return headingCommand(decision, Heading.WEST);
                 }
-            }
-            if (!movingEast && posX <= MIN_X) {
-                // Turn south if not at bottom boundary
+            } else if (!movingEast && posX <= MIN_X) {
+                // Turn south if possible
                 if (posY < MAX_Y) {
                     return headingCommand(decision, Heading.SOUTH);
                 } else {
-                    // If y is at the bottom, turn east
+                    // Turn east
                     movingEast = true;
                     return headingCommand(decision, Heading.EAST);
                 }
             }
 
-            // Otherwise, if we are heading south but at y>=MAX_Y => flip direction horizontally
+            // If heading south and y=MAX_Y => flip horizontal direction
             if (heading == Heading.SOUTH && posY >= MAX_Y) {
-                // Flip horizontal direction
-                if (movingEast) movingEast = false; else movingEast = true;
-                if (movingEast) return headingCommand(decision, Heading.EAST);
-                else            return headingCommand(decision, Heading.WEST);
-            }
-            // Similarly, if heading north but at y<=MIN_Y => flip
-            if (heading == Heading.NORTH && posY <= MIN_Y) {
-                if (movingEast) movingEast = false; else movingEast = true;
-                if (movingEast) return headingCommand(decision, Heading.EAST);
-                else            return headingCommand(decision, Heading.WEST);
+                movingEast = !movingEast;
+                return headingCommand(decision, movingEast ? Heading.EAST : Heading.WEST);
             }
 
-            // If none of the above boundary checks, just fly
+            // If heading north (rare in this pattern) and y=MIN_Y => flip
+            if (heading == Heading.NORTH && posY <= MIN_Y) {
+                movingEast = !movingEast;
+                return headingCommand(decision, movingEast ? Heading.EAST : Heading.WEST);
+            }
+
+            // Otherwise => fly
             decision.put("action", "fly");
-            logger.info("** Decision: FLY forward heading={}, stepCount={}", heading, stepCount);
+            logger.info("** Decision: FLY (heading={}, step={})", heading, stepCount);
         }
 
         stepCount++;
         return decision.toString();
     }
 
-    // ----------------------------------------------------------------
+    // --------------------------------------------------
     // 3) acknowledgeResults
-    // ----------------------------------------------------------------
+    // --------------------------------------------------
     @Override
     public void acknowledgeResults(String s) {
-        JSONObject response = new JSONObject(new JSONTokener(new StringReader(s)));
-        logger.info("** Response received:\n{}", response.toString(2));
+        JSONObject resp = new JSONObject(new JSONTokener(new StringReader(s)));
+        logger.info("** ackResults => \n{}", resp.toString(2));
 
-        int cost = response.getInt("cost");
-        batteryLevel -= cost;
+        int cost = resp.getInt("cost");
+        battery -= cost;
 
-        String status = response.getString("status");
-        logger.info("Action cost={}, battery={}, status={}", cost, batteryLevel, status);
+        String status = resp.getString("status");
+        logger.info("battery={}, cost={}, status={}", battery, cost, status);
 
-        // If MIA or battery < 0 => missionOver
-        if ("MIA".equalsIgnoreCase(status) || batteryLevel <= 0) {
-            logger.error("** Drone is MIA or battery exhausted => STOP");
+        if ("MIA".equalsIgnoreCase(status) || battery <= 0) {
+            logger.error("** MIA or battery=0 => missionOver");
             missionOver = true;
             return;
         }
 
-        JSONObject extras = response.getJSONObject("extras");
-        logger.info("Extras: {}", extras);
+        JSONObject extras = resp.getJSONObject("extras");
 
-        // If heading was changed, environment might set new heading
+        // If heading changed
         if (extras.has("heading")) {
-            String newDir = extras.getString("heading");
-            this.heading = parseHeading(newDir);
+            this.heading = parseHeading(extras.getString("heading"));
             logger.info("** Updated heading => {}", heading);
         }
-
-        // If action was "fly", environment might give new position
+        // If we flew, environment might give new position
         if (extras.has("position")) {
             JSONObject posObj = extras.getJSONObject("position");
             this.posX = posObj.getInt("x");
             this.posY = posObj.getInt("y");
             logger.info("** Updated position => ({},{})", posX, posY);
-            visitedTiles.add(new Coordinate(posX, posY));
-            // If out of bounds => stop next time
         }
 
-        // If we discovered anything
+        // If "creeks" or "sites" found from scanning
         if (extras.has("creeks")) {
-            // Some versions put creeks in "creeks", others put them in "pois"
-            var arr = extras.getJSONArray("creeks");
-            for (int i=0; i < arr.length(); i++) {
-                String c = arr.getString(i); // might just be an ID or label
-                logger.info("** Found a creek => {}", c);
-                if (foundCreekId == null) {
-                    foundCreekId = c;
-                }
+            if (extras.getJSONArray("creeks").length() > 0) {
+                foundCreek = true;
+                logger.info("** Found a creek => foundCreek = true");
             }
         }
         if (extras.has("sites")) {
-            var arr = extras.getJSONArray("sites");
-            for (int i=0; i < arr.length(); i++) {
-                String st = arr.getString(i);
-                logger.info("** Found an emergency SITE => {}", st);
-                this.foundEmergencySite = true;
+            if (extras.getJSONArray("sites").length() > 0) {
+                foundSite = true;
+                logger.info("** Found a site => foundSite = true");
             }
         }
-
-        // If the environment uses "pois" array for both, handle similarly:
-        // if (extras.has("pois")) { ... parse each POI to check if it's a CREEK or SITE ... }
-
-        // Mark mission over if needed
-        if (batteryLevel <= 0) {
-            missionOver = true;
-        }
     }
 
-    // ----------------------------------------------------------------
+    // --------------------------------------------------
     // 4) deliverFinalReport
-    // ----------------------------------------------------------------
+    // --------------------------------------------------
     @Override
     public String deliverFinalReport() {
-        if (foundCreekId != null) {
-            return foundCreekId;
+        if (foundCreek) {
+            // Return some placeholder or real creek ID if you stored it
+            return "Found a creek!";
         }
-        return "No creek found";
+        return "No creek found.";
     }
 
-    // ----------------------------------------------------------------
-    // Some Helpers
-    // ----------------------------------------------------------------
+    // --------------------------------------------------
+    // Helpers
+    // --------------------------------------------------
     private boolean inBounds(int x, int y) {
         return (x >= MIN_X && x <= MAX_X && y >= MIN_Y && y <= MAX_Y);
     }
 
     private String headingCommand(JSONObject decision, Heading desired) {
         if (isIllegalUturn(this.heading, desired)) {
-            Heading inter = pickIntermediateHeading(this.heading, desired);
+            // do an intermediate 90° turn
+            Heading mid = pickIntermediateHeading(this.heading, desired);
             decision.put("action", "heading");
-            decision.put("direction", headingToString(inter));
-            logger.info("** Decision: intermediate turn => {}", inter);
+            decision.put("direction", headingToString(mid));
+            logger.info("** Decision: intermediate heading => {}", mid);
         } else {
             decision.put("action", "heading");
             decision.put("direction", headingToString(desired));
             logger.info("** Decision: turn => {}", desired);
         }
         return decision.toString();
-    }
-
-    private Heading parseHeading(String dir) {
-        dir = dir.trim().toUpperCase();
-        switch (dir) {
-            case "E": case "EAST":  return Heading.EAST;
-            case "W": case "WEST":  return Heading.WEST;
-            case "N": case "NORTH": return Heading.NORTH;
-            case "S": case "SOUTH": return Heading.SOUTH;
-            default:                return Heading.EAST;
-        }
-    }
-
-    private String headingToString(Heading h) {
-        switch (h) {
-            case NORTH: return "N";
-            case SOUTH: return "S";
-            case WEST:  return "W";
-            case EAST:  return "E";
-        }
-        return "E";
     }
 
     private boolean isIllegalUturn(Heading c, Heading d) {
@@ -302,15 +240,39 @@ public class Explorer implements IExplorerRaid {
             || (c == Heading.SOUTH && d == Heading.NORTH);
     }
 
-    private Heading pickIntermediateHeading(Heading c, Heading d) {
-        // Example: if c=E and d=W, pick N or S
-        // We'll pick a consistent "turn left"
-        switch (c) {
+    private Heading pickIntermediateHeading(Heading from, Heading to) {
+        // We'll pick "turn left"
+        switch (from) {
             case EAST:  return Heading.NORTH;
             case WEST:  return Heading.SOUTH;
             case NORTH: return Heading.WEST;
             case SOUTH: return Heading.EAST;
-            default:    return Heading.NORTH;
+            default:    return Heading.EAST;
         }
+    }
+
+    private Heading parseHeading(String dir) {
+        dir = dir.trim().toUpperCase();
+        switch (dir) {
+            case "N":
+            case "NORTH": return Heading.NORTH;
+            case "S":
+            case "SOUTH": return Heading.SOUTH;
+            case "E":
+            case "EAST":  return Heading.EAST;
+            case "W":
+            case "WEST":  return Heading.WEST;
+            default:      return Heading.EAST;
+        }
+    }
+
+    private String headingToString(Heading h) {
+        switch (h) {
+            case NORTH: return "N";
+            case SOUTH: return "S";
+            case EAST:  return "E";
+            case WEST:  return "W";
+        }
+        return "E";
     }
 }
