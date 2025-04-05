@@ -21,19 +21,21 @@ public class OutOfRangeChecker {
      * @return true if the move would be out of range, or false otherwise
      */
     public boolean wouldGoOutOfBounds(String dir, int x, int y) {
-        int nx = x;
-        int ny = y;
-
-        switch (dir.toUpperCase()) {
-            case "NORTH": ny++;  break;
-            case "SOUTH": ny--;  break;
-            case "EAST":  nx++;  break;
-            case "WEST":  nx--;  break;
-            default:
-                // if direction wasn't recognized, treat as no movement
-                break;
-        }
+        MovementDirection direction = getDirection(dir);
+        int nx = direction.moveX(x);
+        int ny = direction.moveY(y);
 
         return (nx < MIN_X || nx > MAX_X || ny < MIN_Y || ny > MAX_Y);
+    }
+
+    //maps the string direction to corresponding MovementDirection interface for Strategy Design Pattern
+    private MovementDirection getDirection(String dir) {
+        switch (dir.toUpperCase()) {
+            case "NORTH": return new NorthDirection();
+            case "SOUTH": return new SouthDirection();
+            case "EAST":  return new EastDirection();
+            case "WEST":  return new WestDirection();
+            default:      return new NoDirection();  //default for unrecognized directions
+        }
     }
 }

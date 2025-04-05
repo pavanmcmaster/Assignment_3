@@ -11,50 +11,57 @@ public class DroneState {
     private int droneX;
     private int droneY;
 
-    /**
-     * Creates a new DroneState with initial values.
-     *
-     * @param b    the initial battery level
-     * @param dir  the initial heading direction (e.g., "NORTH")
-     * @param x    the starting X-coordinate
-     * @param y    the starting Y-coordinate
-     */
-    public DroneState(int b, String dir, int x, int y) {
-        this.battery   = b;
-        this.direction = dir;
-        this.droneX    = x;
-        this.droneY    = y;
+    private DroneState(Builder builder) {
+        this.battery = builder.battery;
+        this.direction = builder.direction;
+        this.droneX = builder.droneX;
+        this.droneY = builder.droneY;
     }
 
     public int getBattery() {
         return battery;
     }
 
-    public void setBattery(int b) {
-        this.battery = b;
-    }
-
     public String getDirection() {
         return direction;
-    }
-
-    public void setDirection(String d) {
-        this.direction = d;
     }
 
     public int getDroneX() {
         return droneX;
     }
 
-    public void setDroneX(int x) {
-        this.droneX = x;
-    }
-
     public int getDroneY() {
         return droneY;
     }
 
-    public void setDroneY(int y) {
-        this.droneY = y;
+    public static class Builder {  //use builder pattern to avoid cluster of constructors and improve readability
+        private int battery;
+        private String direction;
+        private int droneX;
+        private int droneY;
+
+        public Builder setBattery(int battery) {
+            this.battery = battery;
+            return this;
+        }
+
+        public Builder setDirection(String direction) {
+            this.direction = direction;
+            return this;
+        }
+
+        public Builder setDroneX(int droneX) {
+            this.droneX = droneX;
+            return this;
+        }
+
+        public Builder setDroneY(int droneY) {
+            this.droneY = droneY;
+            return this;
+        }
+
+        public DroneState build() {
+            return new DroneState(this);
+        }
     }
 }
