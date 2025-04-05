@@ -1,4 +1,4 @@
-# Assignment A2 - Rescue mission
+# Assignment A3 - Rescue Mission Extended
 
 ## Product Description
 
